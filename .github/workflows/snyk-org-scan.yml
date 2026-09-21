@@ -1,13 +1,319 @@
 name: snyk-org-scan
 
 on:
+  # Cron here is always UTC: 04:45 UTC = 05:45 CET / 06:45 CEST Zurich time.
+  schedule:
+    - cron: '45 4 * * *'
   workflow_dispatch:
+    inputs:
+      repo:
+        description: 'Single repo name (empty = all)'
+        required: false
+      monitor:
+        description: 'Also run snyk monitor'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: snyk-scan-${{ github.event.client_payload.repo || inputs.repo || 'all' }}
+  cancel-in-progress: false
 
 jobs:
-  placeholder:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      repos: ${{ steps.list.outputs.repos }}
+    steps:
+      - id: list
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SINGLE: ${{ github.event.client_payload.repo || inputs.repo }}
+          # Repos that are not scannable code projects (or shouldn't be scanned
+          # by this workflow) and are therefore always skipped from discovery.
+          EXCLUDED_REPOS: "jeap-security-scan,jeap,.github,jeap-admin-ch.github.io"
+        run: |
+          set -euo pipefail
+          if [ -n "${SINGLE:-}" ]; then
+            echo "repos=$(jq -cn --arg r "$SINGLE" '[$r]')" >> "$GITHUB_OUTPUT"
+          else
+            EXCLUDE_JSON=$(jq -cn --arg csv "$EXCLUDED_REPOS" '$csv | split(",") | map(select(length>0))')
+            gh api --paginate orgs/jeap-admin-ch/repos \
+              --jq '.[] | select(.archived==false and .fork==false and .visibility=="public") | .name' \
+              | jq -R -s -c --argjson exclude "$EXCLUDE_JSON" \
+                'split("\n") | map(select(length>0)) | map(select(. as $n | ($exclude | index($n)) == null))' > repos.json
+            echo "repos=$(cat repos.json)" >> "$GITHUB_OUTPUT"
+          fi
+
+  snyk:
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        repo: ${{ fromJson(needs.discover.outputs.repos) }}
+    steps:
+      - name: Checkout ${{ matrix.repo }}
+        uses: actions/checkout@v4
+        with:
+          repository: jeap-admin-ch/${{ matrix.repo }}
+          path: target-repo
+          persist-credentials: false
+
+      # Upload SARIF resolves the commit via `git rev-parse HEAD` at the
+      # checkout path, not GITHUB_SHA. Left in place, that would point at
+      # matrix.repo's commit, which doesn't exist in this (jeap-security-scan)
+      # repo and the API upload fails with "commit not found". Dropping the
+      # checked-out .git makes the action fall back to this workflow's own
+      # GITHUB_SHA/GITHUB_REF, which is what the upload actually targets.
+      - name: Detach checked-out repo from its own git history
+        run: rm -rf target-repo/.git
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+          # Not every scanned repo is a Maven project; only enable the cache
+          # when a pom.xml is actually present, otherwise setup-java fails hard.
+          cache: ${{ hashFiles('target-repo/**/pom.xml') != '' && 'maven' || '' }}
+
+      - uses: snyk/actions/setup@master
+
+      - name: Snyk Open Source test
+        continue-on-error: true
+        working-directory: target-repo
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          snyk test \
+            --all-projects \
+            --detection-depth=6 \
+            --severity-threshold=high \
+            --remote-repo-url=https://github.com/jeap-admin-ch/${{ matrix.repo }} \
+            --sarif-file-output=snyk.sarif || true
+          # A stub with an empty "runs" array can be rejected by the code
+          # scanning upload API ("Invalid request"), so include minimal but
+          # valid tool/run information instead.
+          test -f snyk.sarif || jq -n \
+            '{
+              version: "2.1.0",
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              runs: [
+                {
+                  tool: {
+                    driver: {
+                      name: "Snyk Open Source",
+                      rules: []
+                    }
+                  },
+                  results: []
+                }
+              ]
+            }' > snyk.sarif
+
+      # --all-projects with a wide detection depth typically produces one
+      # SARIF "run" per manifest file, which can easily exceed the code
+      # scanning hard limit of 20 runs per file (results in "rejecting SARIF,
+      # as there are more runs than allowed"). Collapse everything into a
+      # single run, de-duplicating rules and remapping result ruleIndex
+      # references accordingly.
+      - name: Merge SARIF runs
+        working-directory: target-repo
+        run: |
+          python3 - <<'EOF'
+          import json
+
+          with open("snyk.sarif") as f:
+              data = json.load(f)
+
+          runs = data.get("runs", [])
+          if len(runs) > 1:
+              merged_rules = []
+              rule_id_to_index = {}
+              merged_results = []
+
+              for run in runs:
+                  rules = run.get("tool", {}).get("driver", {}).get("rules", [])
+                  local_map = {}
+                  for i, rule in enumerate(rules):
+                      rid = rule.get("id")
+                      if rid not in rule_id_to_index:
+                          rule_id_to_index[rid] = len(merged_rules)
+                          merged_rules.append(rule)
+                      local_map[i] = rule_id_to_index[rid]
+
+                  for result in run.get("results", []):
+                      if "ruleIndex" in result and result["ruleIndex"] in local_map:
+                          result["ruleIndex"] = local_map[result["ruleIndex"]]
+                      merged_results.append(result)
+
+              driver = runs[0].get("tool", {}).get("driver", {})
+              driver["rules"] = merged_rules
+              data["runs"] = [{"tool": {"driver": driver}, "results": merged_results}]
+
+              with open("snyk.sarif", "w") as f:
+                  json.dump(data, f)
+          EOF
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: target-repo/snyk.sarif
+          checkout_path: target-repo
+          category: snyk-oss-${{ matrix.repo }}
+
+      # Only snapshot when the code actually moved, not on every daily sweep.
+      - name: Snyk monitor
+        if: github.event_name == 'repository_dispatch' || inputs.monitor
+        continue-on-error: true
+        working-directory: target-repo
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          snyk monitor \
+            --all-projects \
+            --detection-depth=6 \
+            --remote-repo-url=https://github.com/jeap-admin-ch/${{ matrix.repo }} \
+            --project-name=${{ matrix.repo }}
+
+  notify-ms-teams:
+    needs: [discover, snyk]
+    if: always() && (needs.discover.result == 'failure' || needs.snyk.result == 'failure')
     runs-on: ubuntu-latest
     steps:
-      - name: Placeholder
+      - name: Notify Microsoft Teams in case of scan failure
+        env:
+          MS_TEAMS_WEBHOOK: ${{ secrets.MS_TEAMS_WEBHOOK }}
+          DISCOVER_STATUS: ${{ needs.discover.result }}
+          SNYK_STATUS: ${{ needs.snyk.result }}
         run: |
-          echo "This is a minimal stub on the default branch."
-          echo "Run the full snyk-org-scan workflow from the feature branch instead."
+          if [ -z "$MS_TEAMS_WEBHOOK" ]; then
+            echo "MS_TEAMS_WEBHOOK is not configured"
+            exit 0
+          fi
+
+          format_status() {
+            case "$1" in
+              success)
+                echo "🟢 Success"
+                ;;
+              failure)
+                echo "🔴 Failed"
+                ;;
+              cancelled)
+                echo "🟡 Cancelled"
+                ;;
+              skipped)
+                echo "⚪ Skipped"
+                ;;
+              *)
+                echo "⚪ ${1:-Unknown}"
+                ;;
+            esac
+          }
+
+          DISCOVER_STATUS_TEXT="$(format_status "$DISCOVER_STATUS")"
+          SNYK_STATUS_TEXT="$(format_status "$SNYK_STATUS")"
+
+          if [ "$DISCOVER_STATUS" = "failure" ] || [ "$SNYK_STATUS" = "failure" ]; then
+            OVERALL_STATUS="Failed"
+            OVERALL_ICON="🔴"
+          elif [ "$DISCOVER_STATUS" = "cancelled" ] || [ "$SNYK_STATUS" = "cancelled" ]; then
+            OVERALL_STATUS="Cancelled"
+            OVERALL_ICON="🟡"
+          else
+            OVERALL_STATUS="${DISCOVER_STATUS:-${SNYK_STATUS:-Unknown}}"
+            OVERALL_ICON="⚪"
+          fi
+
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          jq -n \
+            --arg workflow "${{ github.workflow }}" \
+            --arg project "${{ github.repository }}" \
+            --arg status "$OVERALL_STATUS" \
+            --arg statusIcon "$OVERALL_ICON" \
+            --arg discoverStatus "$DISCOVER_STATUS_TEXT" \
+            --arg snykStatus "$SNYK_STATUS_TEXT" \
+            --arg repository "${{ github.repository }}" \
+            --arg actor "${{ github.actor }}" \
+            --arg runId "${{ github.run_id }}" \
+            --arg runUrl "$RUN_URL" \
+            '{
+              type: "message",
+              attachments: [
+                {
+                  contentType: "application/vnd.microsoft.card.adaptive",
+                  content: {
+                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    type: "AdaptiveCard",
+                    version: "1.4",
+                    body: [
+                      {
+                        type: "TextBlock",
+                        text: "GitHub Actions",
+                        weight: "Bolder",
+                        size: "Medium"
+                      },
+                      {
+                        type: "TextBlock",
+                        text: ($workflow + " • " + $project),
+                        weight: "Bolder",
+                        size: "Large",
+                        wrap: true
+                      },
+                      {
+                        type: "FactSet",
+                        facts: [
+                          {
+                            title: "Status",
+                            value: ($statusIcon + " " + $status)
+                          },
+                          {
+                            title: "Discover",
+                            value: $discoverStatus
+                          },
+                          {
+                            title: "Snyk scan",
+                            value: $snykStatus
+                          },
+                          {
+                            title: "Repository",
+                            value: $repository
+                          },
+                          {
+                            title: "Triggered by",
+                            value: $actor
+                          },
+                          {
+                            title: "Run",
+                            value: ("#" + $runId)
+                          }
+                        ]
+                      }
+                    ],
+                    actions: [
+                      {
+                        type: "Action.OpenUrl",
+                        title: "View GitHub Actions run",
+                        url: $runUrl
+                      }
+                    ]
+                  }
+                }
+              ]
+            }' |
+            http_code=$(curl --silent --show-error \
+              --output /dev/null \
+              --write-out "%{http_code}" \
+              -H "Content-Type: application/json" \
+              --data-binary @- \
+              "$MS_TEAMS_WEBHOOK" 2>/dev/null)
+            if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+              echo "Teams notification failed (HTTP status: $http_code)"
+              exit 1
+            fi
