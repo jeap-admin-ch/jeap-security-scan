@@ -1,0 +1,13 @@
+name: snyk-org-scan
+
+on:
+  workflow_dispatch:
+
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Placeholder
+        run: |
+          echo "This is a minimal stub on the default branch."
+          echo "Run the full snyk-org-scan workflow from the feature branch instead."
