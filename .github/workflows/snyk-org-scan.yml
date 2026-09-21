@@ -160,7 +160,7 @@ jobs:
           EOF
 
       - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: target-repo/snyk.sarif
           checkout_path: target-repo
