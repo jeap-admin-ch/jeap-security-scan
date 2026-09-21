@@ -1,0 +1,8 @@
+version: 2
+updates:
+  # This repo only contains GitHub Actions workflows, so Dependabot only
+  # needs to track the actions/action versions used within them.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
