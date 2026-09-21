@@ -58,7 +58,7 @@ jobs:
         repo: ${{ fromJson(needs.discover.outputs.repos) }}
     steps:
       - name: Checkout ${{ matrix.repo }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: jeap-admin-ch/${{ matrix.repo }}
           path: target-repo
