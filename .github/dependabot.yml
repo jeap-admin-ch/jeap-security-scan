@@ -6,3 +6,9 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      # Bundle all action updates into a single PR per schedule run instead
+      # of one PR per action.
+      github-actions:
+        patterns:
+          - "*"
