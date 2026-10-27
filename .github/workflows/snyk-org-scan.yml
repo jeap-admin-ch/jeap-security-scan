@@ -64,15 +64,6 @@ jobs:
           path: target-repo
           persist-credentials: false
 
-      # Upload SARIF resolves the commit via `git rev-parse HEAD` at the
-      # checkout path, not GITHUB_SHA. Left in place, that would point at
-      # matrix.repo's commit, which doesn't exist in this (jeap-security-scan)
-      # repo and the API upload fails with "commit not found". Dropping the
-      # checked-out .git makes the action fall back to this workflow's own
-      # GITHUB_SHA/GITHUB_REF, which is what the upload actually targets.
-      - name: Detach checked-out repo from its own git history
-        run: rm -rf target-repo/.git
-
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
@@ -83,18 +74,55 @@ jobs:
 
       - uses: snyk/actions/setup@master
 
-      - name: Snyk Open Source test
+      # Multi-module Maven repos depend on their own (SNAPSHOT) sibling
+      # modules. Without installing them, Snyk cannot resolve those and drops
+      # their transitive dependencies from the dependent module's tree.
+      - name: Build Maven reactor for Snyk
+        if: ${{ hashFiles('target-repo/pom.xml') != '' }}
         continue-on-error: true
+        working-directory: target-repo
+        # The jEAP parent hardwires skipTests to skip.surefire.tests / skip.failsafe.tests,
+        # so -DskipTests alone has no effect there.
+        run: |
+          # Prefer the repo's Maven wrapper so the build uses the Maven version the repo pins.
+          if [ -f ./mvnw ]; then
+            chmod +x ./mvnw
+            MVN=./mvnw
+          else
+            MVN=mvn
+          fi
+          "$MVN" -B -q install \
+            -DskipTests -Dskip.surefire.tests=true -Dskip.failsafe.tests=true \
+            -Dmaven.test.failure.ignore=true -Dmaven.javadoc.skip=true
+
+      # Upload SARIF resolves the commit via `git rev-parse HEAD` at the
+      # checkout path, not GITHUB_SHA. Left in place, that would point at
+      # matrix.repo's commit, which doesn't exist in this (jeap-security-scan)
+      # repo and the API upload fails with "commit not found". Dropping the
+      # checked-out .git makes the action fall back to this workflow's own
+      # GITHUB_SHA/GITHUB_REF, which is what the upload actually targets.
+      - name: Detach checked-out repo from its own git history
+        run: rm -rf target-repo/.git
+
+      - name: Snyk Open Source test
+        id: snyk-test
         working-directory: target-repo
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
+          # Don't fail here: SARIF merge/upload must still run. The exit code
+          # is evaluated in the "Fail on vulnerabilities" step at the end.
+          # Snyk exit codes: 0 = clean, 1 = vulnerabilities, 2 = scan error,
+          # 3 = no supported projects found.
+          set +e
           snyk test \
             --all-projects \
             --detection-depth=6 \
             --severity-threshold=high \
             --remote-repo-url=https://github.com/jeap-admin-ch/${{ matrix.repo }} \
-            --sarif-file-output=snyk.sarif || true
+            --sarif-file-output=snyk.sarif
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          set -e
           # A stub with an empty "runs" array can be rejected by the code
           # scanning upload API ("Invalid request"), so include minimal but
           # valid tool/run information instead.
@@ -159,12 +187,64 @@ jobs:
                   json.dump(data, f)
           EOF
 
+      - name: Job summary
+        if: ${{ always() }}
+        working-directory: target-repo
+        env:
+          REPO: ${{ matrix.repo }}
+          EXIT_CODE: ${{ steps.snyk-test.outputs.exit_code }}
+        run: |
+          python3 - <<'EOF'
+          import json, os
+
+          out = open(os.environ["GITHUB_STEP_SUMMARY"], "a")
+          repo = os.environ["REPO"]
+          exit_code = os.environ.get("EXIT_CODE", "")
+          out.write(f"## {repo}\n\n")
+
+          try:
+              with open("snyk.sarif") as f:
+                  run = json.load(f)["runs"][0]
+          except Exception as e:
+              out.write(f"No SARIF result available ({e}).\n")
+              raise SystemExit(0)
+
+          rules = {r.get("id"): r for r in run.get("tool", {}).get("driver", {}).get("rules", [])}
+          findings = {}  # (rule id, manifest) -> level
+          for res in run.get("results", []):
+              uri = (res.get("locations") or [{}])[0].get("physicalLocation", {}).get("artifactLocation", {}).get("uri", "")
+              findings[(res.get("ruleId"), uri)] = res.get("level", "warning")
+
+          if exit_code == "2":
+              out.write("**Snyk scan error (exit code 2)** - results may be incomplete.\n\n")
+          if not findings:
+              out.write("No High/Critical vulnerabilities found.\n")
+              raise SystemExit(0)
+
+          levels = {"error": "High/Critical", "warning": "Medium", "note": "Low"}
+          counts = {}
+          for lvl in findings.values():
+              counts[lvl] = counts.get(lvl, 0) + 1
+          out.write(f"**{len(findings)} vulnerabilities** (" + ", ".join(
+              f"{levels.get(l, l)}: {n}" for l, n in sorted(counts.items())) + ")\n\n")
+          out.write("| Vulnerability | Manifest |\n|---|---|\n")
+          for (rid, uri), lvl in sorted(findings.items(), key=lambda kv: (kv[1], kv[0])):
+              title = rules.get(rid, {}).get("shortDescription", {}).get("text", rid)
+              out.write(f"| [{title}](https://security.snyk.io/vuln/{rid}) | `{uri}` |\n")
+          EOF
+
       - name: Upload SARIF
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: target-repo/snyk.sarif
           checkout_path: target-repo
           category: snyk-oss-${{ matrix.repo }}
+
+      - name: Fail on vulnerabilities
+        if: ${{ always() && steps.snyk-test.outputs.exit_code != '0' && steps.snyk-test.outputs.exit_code != '3' }}
+        run: |
+          echo "::error::snyk test exited with code ${{ steps.snyk-test.outputs.exit_code || 'unknown' }} (1 = vulnerabilities found, 2 = scan error)"
+          exit 1
 
       # Only snapshot when the code actually moved, not on every daily sweep.
       - name: Snyk monitor
