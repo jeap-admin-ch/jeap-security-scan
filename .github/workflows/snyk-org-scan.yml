@@ -114,11 +114,15 @@ jobs:
           # is evaluated in the "Fail on vulnerabilities" step at the end.
           # Snyk exit codes: 0 = clean, 1 = vulnerabilities, 2 = scan error,
           # 3 = no supported projects found.
+          # --fail-on=upgradable: only exit 1 for issues Snyk has an upgrade path for.
+          # Issues without a direct upgrade (e.g. fixable only by a transitive
+          # override) do NOT fail the job, but still show up in the SARIF upload.
           set +e
           snyk test \
             --all-projects \
             --detection-depth=6 \
             --severity-threshold=high \
+            --fail-on=upgradable \
             --remote-repo-url=https://github.com/jeap-admin-ch/${{ matrix.repo }} \
             --sarif-file-output=snyk.sarif
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
