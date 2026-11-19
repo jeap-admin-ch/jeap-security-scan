@@ -27,6 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       repos: ${{ steps.list.outputs.repos }}
+      m2-cache-prefix: ${{ steps.list.outputs.m2-cache-prefix }}
     steps:
       - id: list
         env:
@@ -37,6 +38,10 @@ jobs:
           EXCLUDED_REPOS: "jeap-security-scan,jeap,.github,jeap-admin-ch.github.io"
         run: |
           set -euo pipefail
+          # Key prefix of the shared Maven cache (see the warm-up job). The month
+          # makes the cache start from scratch once a month, so that dependency
+          # versions no repo uses any more drop out of it.
+          echo "m2-cache-prefix=m2-shared-$(date -u +%Y-%m)-" >> "$GITHUB_OUTPUT"
           if [ -n "${SINGLE:-}" ]; then
             echo "repos=$(jq -cn --arg r "$SINGLE" '[$r]')" >> "$GITHUB_OUTPUT"
           else
@@ -48,8 +53,133 @@ jobs:
             echo "repos=$(cat repos.json)" >> "$GITHUB_OUTPUT"
           fi
 
-  snyk:
+  # Maven Central throttles the runners (HTTP 429, or 404 for files that exist)
+  # when every matrix job downloads its dependencies on its own. The jEAP repos
+  # share most of their dependencies, so this job builds a few of the largest
+  # ones first and saves the local Maven repository as one cache, which every
+  # matrix job then restores.
+  # A cache per repo does not work here: keyed on the hash of the poms it is
+  # invalidated by almost every commit, and all of them together exceed the
+  # cache storage limit of this repo, so they are evicted before the next run.
+  warm-up:
     needs: discover
+    # A scan of a single repo uses the cache of the last full run as it is.
+    if: ${{ !(github.event.client_payload.repo || inputs.repo) }}
+    runs-on: ubuntu-latest
+    # Only an optimisation: the scans run without it and decide the result of
+    # the workflow.
+    continue-on-error: true
+    env:
+      # The repos with the largest dependency sets. "Maven downloads" in the
+      # overview shows what the scans still had to download with this choice.
+      WARM_UP_REPOS: jeap-error-handling jeap-process-context-service jeap-messaging
+    steps:
+      - name: Checkout warm-up repos
+        run: |
+          for repo in $WARM_UP_REPOS; do
+            git clone --quiet --depth 1 "https://github.com/jeap-admin-ch/$repo.git" "warm-up/$repo"
+          done
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Restore Maven wrapper distributions
+        id: mvnw-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.m2/wrapper/dists
+          key: mvnw-${{ hashFiles('warm-up/*/mvnw', 'warm-up/*/.mvn/wrapper/*') }}
+
+      # The key has no hash on purpose: the cache is taken over from the newest
+      # one (restore-keys) and saved under a new key, as a cache cannot be
+      # updated. Older ones are left to the eviction of GitHub. If the cache
+      # ever causes problems, delete all caches of this repo: the next run
+      # builds a new one.
+      - name: Restore shared Maven cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.m2/repository
+          key: ${{ needs.discover.outputs.m2-cache-prefix }}${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ needs.discover.outputs.m2-cache-prefix }}
+
+      - name: Build warm-up repos
+        id: build
+        run: |
+          set -uo pipefail
+          # Keep in sync with "Build Maven reactor for Snyk" in the snyk job.
+          DOWNLOAD_ERRORS='status code: (429|5[0-9]{2})|Too Many Requests|Could not (transfer|find) artifact|FileNotFoundException|Server returned HTTP response code|Failed to fetch|timed out|Connection (reset|refused)'
+          maven_install() {
+            local mvn=mvn attempt
+            if [ -f ./mvnw ]; then
+              chmod +x ./mvnw
+              mvn=./mvnw
+            fi
+            for attempt in 1 2 3; do
+              "$mvn" -B -q install \
+                -DskipTests -Dskip.surefire.tests=true -Dskip.failsafe.tests=true \
+                -Dmaven.test.failure.ignore=true -Dmaven.javadoc.skip=true 2>&1 | tee "$RUNNER_TEMP/maven.log" && return 0
+              [ "$attempt" -lt 3 ] && grep -qiE "$DOWNLOAD_ERRORS" "$RUNNER_TEMP/maven.log" || return 1
+              echo "::warning::Download from a Maven repository failed (attempt $attempt of 3), retrying in $((attempt * 30))s"
+              sleep $((attempt * 30))
+            done
+          }
+          succeeded=0
+          failed=0
+          for repo in $WARM_UP_REPOS; do
+            echo "::group::$repo"
+            if (cd "warm-up/$repo" && maven_install); then
+              succeeded=$((succeeded + 1))
+            else
+              failed=$((failed + 1))
+              echo "::warning::Warm-up build of $repo failed, its dependencies may be missing in the shared Maven cache"
+            fi
+            echo "::endgroup::"
+          done
+          echo "succeeded=$succeeded" >> "$GITHUB_OUTPUT"
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
+
+      # A cache is never updated once it exists, so only save the distributions
+      # when every build got its own: an incomplete cache would make every
+      # later run download the missing ones.
+      - name: Check Maven wrapper distributions
+        id: mvnw-dist
+        if: ${{ steps.mvnw-cache.outputs.cache-hit != 'true' && steps.build.outputs.failed == '0' }}
+        run: |
+          if [ -n "$(find ~/.m2/wrapper/dists -path '*/bin/mvn' -print -quit 2>/dev/null)" ]; then
+            echo "complete=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save Maven wrapper distributions
+        if: ${{ steps.mvnw-dist.outputs.complete == 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.m2/wrapper/dists
+          key: ${{ steps.mvnw-cache.outputs.cache-primary-key }}
+
+      # The builds install the SNAPSHOT modules of the warm-up repos. They stay
+      # out of the shared cache: every scanned repo builds its own modules and
+      # must not pick up the ones of another build.
+      - name: Remove snapshots from the local Maven repository
+        run: |
+          if [ -d ~/.m2/repository ]; then
+            find ~/.m2/repository -type d -name '*-SNAPSHOT' -prune -exec rm -rf {} +
+          fi
+
+      # Without a successful build the local repository may be nearly empty,
+      # and as the newest cache it would replace a good one for the scans.
+      - name: Save shared Maven cache
+        if: ${{ steps.build.outputs.succeeded != '0' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.m2/repository
+          key: ${{ needs.discover.outputs.m2-cache-prefix }}${{ github.run_id }}-${{ github.run_attempt }}
+
+  snyk:
+    needs: [discover, warm-up]
+    # Also run when the warm-up job was skipped (scan of a single repo) or failed.
+    if: ${{ !cancelled() && needs.discover.result == 'success' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -64,15 +194,42 @@ jobs:
           path: target-repo
           persist-credentials: false
 
+      # No "cache: maven" here, see the warm-up job and the wrapper cache below.
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '25'
-          # Not every scanned repo is a Maven project; only enable the cache
-          # when a pom.xml is actually present, otherwise setup-java fails hard.
-          cache: ${{ hashFiles('target-repo/**/pom.xml') != '' && 'maven' || '' }}
 
       - uses: snyk/actions/setup@master
+
+      # Keyed on the wrapper itself and not only on maven-wrapper.properties:
+      # where a wrapper stores the distribution below dists depends on its kind
+      # and version (script only, Takari jar, Apache jar). Repos with the same
+      # properties and different wrappers would otherwise share a cache that
+      # holds the distribution of only one of them, and the others would
+      # download Maven on every run despite the cache hit.
+      - name: Restore Maven wrapper distribution
+        id: mvnw-cache
+        if: ${{ hashFiles('target-repo/mvnw') != '' }}
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.m2/wrapper/dists
+          key: mvnw-${{ hashFiles('target-repo/mvnw', 'target-repo/.mvn/wrapper/*') }}
+
+      # Restore only: the warm-up job is the only one that saves this cache.
+      # The key matches the cache the warm-up job of this run saved, and
+      # restore-keys falls back to the newest one of an earlier run.
+      - name: Restore shared Maven cache
+        if: ${{ hashFiles('target-repo/**/pom.xml') != '' }}
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.m2/repository
+          key: ${{ needs.discover.outputs.m2-cache-prefix }}${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ needs.discover.outputs.m2-cache-prefix }}
+
+      # Reference point for "Count Maven downloads".
+      - name: Mark the restored state of the local Maven repository
+        run: touch "$RUNNER_TEMP/m2-restored"
 
       # Multi-module Maven repos depend on their own (SNAPSHOT) sibling
       # modules. Without installing them, Snyk cannot resolve those and drops
@@ -84,16 +241,46 @@ jobs:
         # The jEAP parent hardwires skipTests to skip.surefire.tests / skip.failsafe.tests,
         # so -DskipTests alone has no effect there.
         run: |
-          # Prefer the repo's Maven wrapper so the build uses the Maven version the repo pins.
-          if [ -f ./mvnw ]; then
-            chmod +x ./mvnw
-            MVN=./mvnw
-          else
-            MVN=mvn
+          set -o pipefail
+          # Maven Central sometimes answers single requests with 429, or with 404 for files that
+          # exist. Retry the build in that case only: one that fails for another reason (some repos
+          # cannot be built here at all) would just fail again.
+          # Keep in sync with "Build warm-up repos" in the warm-up job.
+          DOWNLOAD_ERRORS='status code: (429|5[0-9]{2})|Too Many Requests|Could not (transfer|find) artifact|FileNotFoundException|Server returned HTTP response code|Failed to fetch|timed out|Connection (reset|refused)'
+          maven_install() {
+            local mvn=mvn attempt
+            # Prefer the repo's Maven wrapper so the build uses the Maven version the repo pins.
+            if [ -f ./mvnw ]; then
+              chmod +x ./mvnw
+              mvn=./mvnw
+            fi
+            for attempt in 1 2 3; do
+              "$mvn" -B -q install \
+                -DskipTests -Dskip.surefire.tests=true -Dskip.failsafe.tests=true \
+                -Dmaven.test.failure.ignore=true -Dmaven.javadoc.skip=true 2>&1 | tee "$RUNNER_TEMP/maven.log" && return 0
+              [ "$attempt" -lt 3 ] && grep -qiE "$DOWNLOAD_ERRORS" "$RUNNER_TEMP/maven.log" || return 1
+              echo "::warning::Download from a Maven repository failed (attempt $attempt of 3), retrying in $((attempt * 30))s"
+              sleep $((attempt * 30))
+            done
+          }
+          maven_install
+
+      # A cache is never updated once it exists, so only save a complete
+      # distribution: an incomplete one would make every later run download it.
+      - name: Check Maven wrapper distribution
+        id: mvnw-dist
+        if: ${{ steps.mvnw-cache.outcome == 'success' && steps.mvnw-cache.outputs.cache-hit != 'true' }}
+        run: |
+          if [ -n "$(find ~/.m2/wrapper/dists -path '*/bin/mvn' -print -quit 2>/dev/null)" ]; then
+            echo "complete=true" >> "$GITHUB_OUTPUT"
           fi
-          "$MVN" -B -q install \
-            -DskipTests -Dskip.surefire.tests=true -Dskip.failsafe.tests=true \
-            -Dmaven.test.failure.ignore=true -Dmaven.javadoc.skip=true
+
+      - name: Save Maven wrapper distribution
+        if: ${{ steps.mvnw-dist.outputs.complete == 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.m2/wrapper/dists
+          key: ${{ steps.mvnw-cache.outputs.cache-primary-key }}
 
       # Upload SARIF resolves the commit via `git rev-parse HEAD` at the
       # checkout path, not GITHUB_SHA. Left in place, that would point at
@@ -217,6 +404,25 @@ jobs:
           checkout_path: target-repo
           category: snyk-oss-${{ matrix.repo }}
 
+      # Artifacts that were not in the shared Maven cache and had to be
+      # downloaded, without the SNAPSHOT modules the build installed. The
+      # overview lists them per repo to show how well the warm-up job covers
+      # the dependencies. Compares the inode change time, as Maven may set the
+      # modification time of a download to the one on the server.
+      - name: Count Maven downloads
+        id: m2-downloads
+        if: ${{ always() && hashFiles('target-repo/**/pom.xml') != '' }}
+        run: |
+          stats="0 0"
+          if [ -d ~/.m2/repository ] && [ -f "$RUNNER_TEMP/m2-restored" ]; then
+            stats=$(find ~/.m2/repository -type f \( -name '*.jar' -o -name '*.pom' \) \
+              -cnewer "$RUNNER_TEMP/m2-restored" -not -path '*-SNAPSHOT/*' -printf '%s\n' \
+              | awk '{ bytes += $1 } END { printf "%d %d", NR, bytes / 1048576 }')
+          fi
+          echo "files=${stats% *}" >> "$GITHUB_OUTPUT"
+          echo "mb=${stats#* }" >> "$GITHUB_OUTPUT"
+          echo "Downloaded ${stats% *} artifacts (${stats#* } MB) that were not in the shared Maven cache"
+
       # Compact per-repo result for the "overview" job (one row per finding,
       # with the manifests it appears in).
       - name: Collect result
@@ -226,6 +432,8 @@ jobs:
           REPO: ${{ matrix.repo }}
           EXIT_CODE: ${{ steps.snyk-test.outputs.exit_code }}
           FIXABLE: ${{ steps.snyk-test.outputs.fixable }}
+          M2_FILES: ${{ steps.m2-downloads.outputs.files }}
+          M2_MB: ${{ steps.m2-downloads.outputs.mb }}
         run: |
           findings='[]'
           if [ -f snyk.json ]; then
@@ -245,8 +453,10 @@ jobs:
                       targets: (map(.target) | unique) })' snyk.json || echo '[]')
           fi
           jq -n -c --arg repo "$REPO" --arg exit_code "$EXIT_CODE" --arg fixable "$FIXABLE" \
+            --arg m2_files "$M2_FILES" --arg m2_mb "$M2_MB" \
             --argjson findings "$findings" \
-            '{ repo: $repo, exit_code: $exit_code, fixable: $fixable, findings: $findings }' > result.json
+            '{ repo: $repo, exit_code: $exit_code, fixable: $fixable,
+               m2_files: $m2_files, m2_mb: $m2_mb, findings: $findings }' > result.json
 
       - name: Upload result
         if: ${{ always() }}
@@ -421,6 +631,29 @@ jobs:
               w()
           if not any_repo:
               w("No findings.")
+              w()
+
+          # What the scans still had to download although the warm-up job filled the shared
+          # Maven cache: a repo with many downloads is a candidate for WARM_UP_REPOS.
+          counted = {repo: r for repo, r in results.items() if r.get("m2_files")}
+          if counted:
+              downloads = sorted(((int(r["m2_files"]), int(r.get("m2_mb") or 0), repo)
+                                  for repo, r in counted.items() if int(r["m2_files"]) > 0),
+                                 key=lambda d: (-d[0], d[2]))
+              w("## Maven downloads")
+              w()
+              if downloads:
+                  w(f"<details><summary>{len(downloads)} of {len(counted)} Maven repositories downloaded "
+                    f"artifacts that were not in the shared Maven cache</summary>")
+                  w()
+                  w("| Repository | Artifacts | MB |")
+                  w("|---|---:|---:|")
+                  for files, mb, repo in downloads:
+                      w(f"| {repo} | {files} | {mb} |")
+                  w()
+                  w("</details>")
+              else:
+                  w(f"All {len(counted)} Maven repositories were served from the shared Maven cache.")
           EOF
 
       # The per-repo results are only needed to build the overview, don't leave
